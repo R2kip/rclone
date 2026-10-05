@@ -69,7 +69,7 @@ var initDate = time.Date(2000, time.January, 1, 0, 0, 0, 0, bisync.TZ)
 // go run ./fstest/test_all -remotes local,TestCrypt:,TestDrive:,TestOneDrive:,TestOneDriveBusiness:,TestDropbox:,TestCryptDrive:,TestOpenDrive:,TestChunker:,:memory:,TestCryptNoEncryption:,TestCombine:DirA,TestFTPRclone:,TestWebdavRclone:,TestS3Rclone:,TestSFTPRclone:,TestSFTPRcloneSSH:,TestNextcloud:,TestChunkerNometaLocal:,TestChunkerChunk3bLocal:,TestChunkerLocal:,TestChunkerChunk3bNometaLocal:,TestStorj: -run '^TestBisync.*$' -timeout 3h -verbose -maxtries 5
 // go test -timeout 3h -run '^TestBisync.*$' github.com/rclone/rclone/cmd/bisync -remote TestDrive:Bisync -v
 // go test -timeout 3h -run '^TestBisyncRemoteRemote/basic$' github.com/rclone/rclone/cmd/bisync -remote TestDropbox:Bisync -v
-// TestFTPProftpd:,TestFTPPureftpd:,TestFTPRclone:,TestFTPVsftpd:,TestHdfs:,TestS3Minio:,TestS3MinioEdge:,TestS3Rclone:,TestSeafile:,TestSeafileEncrypted:,TestSeafileV6:,TestSFTPOpenssh:,TestSFTPRclone:,TestSFTPRcloneSSH:,TestSia:,TestSwiftAIO:,TestWebdavNextcloud:,TestWebdavOwncloud:,TestWebdavRclone:
+// TestFTPProftpd:,TestFTPPureftpd:,TestFTPRclone:,TestFTPVsftpd:,TestHdfs:,TestS3Minio:,TestS3Rclone:,TestSeafile:,TestSeafileEncrypted:,TestSeafileV6:,TestSFTPOpenssh:,TestSFTPRclone:,TestSFTPRcloneSSH:,TestSia:,TestSwiftAIO:,TestWebdavNextcloud:,TestWebdavOwncloud:,TestWebdavRclone:
 
 // logReplacements make modern test logs comparable with golden dir.
 // It is a string slice of even length with this structure:
@@ -85,6 +85,8 @@ var logReplacements = []string{
 	`^NOTICE: .*?: Replacing invalid UTF-8 characters in "[^"]*"$`, dropMe,
 	// ignore rclone debug messages
 	`^DEBUG : .*$`, dropMe,
+	// ignore SFTP host key messages
+	`^NOTICE: .*?No host key validation is being performed.*$`, dropMe,
 	// ignore dropbox info messages
 	`^NOTICE: too_many_(requests|write_operations)/\.*: Too many requests or write operations.*$`, dropMe,
 	`^NOTICE: .*?: Forced to upload files to set modification times on this backend.$`, dropMe,
@@ -152,6 +154,9 @@ var logHoppers = []string{
 
 	// Directory modification time setting can happen in any order
 	`INFO  : .*: (Set directory modification time|Made directory with metadata).*`,
+
+	// Tracked renames can finish in any order.
+	`INFO  : .*: Renamed from .*`,
 }
 
 // Some log lines can contain Windows path separator that must be
@@ -329,7 +334,7 @@ func testBisync(ctx context.Context, t *testing.T, path1, path2 string) {
 
 	baseDir, err := os.Getwd()
 	require.NoError(t, err, "get current directory")
-	randName := time.Now().Format("150405") + random.String(2) // some bucket backends don't like dots, keep this short to avoid linux errors
+	randName := time.Now().Format("150405") + random.String(8) // some bucket backends don't like dots, keep this short to avoid linux errors
 	tempDir := filepath.Join(os.TempDir(), randName)
 	workDir := filepath.Join(tempDir, "workdir")
 
@@ -1000,6 +1005,12 @@ func (b *bisyncTest) checkPreReqs(ctx context.Context, opt *bisync.Options) (con
 	if strings.HasPrefix(b.fs2.String(), "sftp") {
 		b.fs2.Features().Disable("Copy") // disable --sftp-copy-is-hardlink as hardlinks are not truly copies
 	}
+	if b.testCase == "max_delete_track_renames" && (!operations.CanServerSideMove(b.fs1) || !operations.CanServerSideMove(b.fs2)) {
+		b.t.Skip("skipping test as at least one remote does not support server-side move or copy")
+	}
+	if b.testCase == "max_delete_track_renames" && b.fs1.Hashes().Overlap(b.fs2.Hashes()).GetOne() == hash.None {
+		b.t.Skip("skipping test as the two remotes have no hash in common")
+	}
 	if strings.Contains(strings.ToLower(fs.ConfigString(b.fs1)), "mailru") || strings.Contains(strings.ToLower(fs.ConfigString(b.fs2)), "mailru") {
 		fs.GetConfig(ctx).TPSLimit = 10 // https://github.com/rclone/rclone/issues/7768#issuecomment-2060888980
 	}
@@ -1150,6 +1161,12 @@ func (b *bisyncTest) runBisync(ctx context.Context, args []string) (err error) {
 		case "max-delete":
 			opt.MaxDelete, err = strconv.Atoi(val)
 			require.NoError(b.t, err, "parsing max-delete=%q", val)
+		case "max-delete-renames-aware":
+			opt.MaxDeleteRenamesAware = true
+		case "track-renames":
+			ci.TrackRenames = true
+		case "track-renames-strategy":
+			ci.TrackRenamesStrategy = val
 		case "size-only":
 			ci.SizeOnly = true
 		case "ignore-size":
@@ -1645,6 +1662,10 @@ func (b *bisyncTest) mangleResult(dir, file string, golden bool) string {
 		)
 	}
 	rep := logReplacements
+	if b.testCase == "max_delete_track_renames" && (b.fs1.Features().Move == nil || b.fs2.Features().Move == nil) {
+		// Without server-side Move, a tracked rename is a server-side copy + delete, counted as a transfer.
+		rep = append(rep, `^.*There was nothing to transfer.*$`, dropMe)
+	}
 	if b.testCase == "dry_run" {
 		rep = append(rep, dryrunReplacements...)
 	}

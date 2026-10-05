@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -283,6 +284,9 @@ type transporter struct {
 
 // Make a new transporter
 func newTransporter(ctx context.Context) transporter {
+	// Set the User-Agent to include the Microsoft Partner Network prefix
+	ctx, ci := fs.AddConfig(ctx)
+	ci.UserAgent = "APN/1.0 rclone/1.0 rclone/" + strings.TrimPrefix(fs.Version, "v")
 	return transporter{
 		RoundTripper: fshttp.NewTransport(ctx),
 	}
@@ -291,6 +295,13 @@ func newTransporter(ctx context.Context) transporter {
 // Do sends the HTTP request and returns the HTTP response or error.
 func (tr transporter) Do(req *http.Request) (*http.Response, error) {
 	return tr.RoundTripper.RoundTrip(req)
+}
+
+// Transporter returns the policy.Transporter rclone uses for Azure SDK
+// clients (an fshttp based transport with the APN user agent), for callers
+// which build their own azcore pipelines.
+func Transporter(ctx context.Context) policy.Transporter {
+	return newTransporter(ctx)
 }
 
 // NewClientOpts should be passed to configure NewClient

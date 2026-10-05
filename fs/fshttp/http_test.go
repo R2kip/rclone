@@ -19,6 +19,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"moul.io/http2curl/v2"
 )
 
 func TestCleanAuth(t *testing.T) {
@@ -58,6 +59,32 @@ func TestCleanAuths(t *testing.T) {
 	} {
 		got := string(cleanAuths([]byte(test.in)))
 		assert.Equal(t, test.want, got, test.in)
+	}
+}
+
+func TestCleanCurl(t *testing.T) {
+	for _, test := range []struct {
+		in   []string
+		want []string
+	}{{
+		[]string{""},
+		[]string{""},
+	}, {
+		[]string{"floo"},
+		[]string{"floo"},
+	}, {
+		[]string{"'Authorization: AAAAAAAAA'", "'Potato: Help'", ""},
+		[]string{"'Authorization: XXXX'", "'Potato: Help'", ""},
+	}, {
+		[]string{"'X-Auth-Token: AAAAAAAAA'", "'Potato: Help'", ""},
+		[]string{"'X-Auth-Token: XXXX'", "'Potato: Help'", ""},
+	}, {
+		[]string{"'X-Auth-Token: AAAAAAAAA'", "'Authorization: AAAAAAAAA'", "'Potato: Help'", ""},
+		[]string{"'X-Auth-Token: XXXX'", "'Authorization: XXXX'", "'Potato: Help'", ""},
+	}} {
+		in := http2curl.CurlCommand(test.in)
+		cleanCurl(&in)
+		assert.Equal(t, test.want, test.in, test.in)
 	}
 }
 
@@ -145,8 +172,8 @@ func TestCertificates(t *testing.T) {
 	// Set --client-cert and --client-key in config to
 	// a pair of temp files
 	// create a test cert/key pair and write it to the files
-	ctx := context.TODO()
-	ci := fs.GetConfig(ctx)
+	// Use a private config so the cert paths don't leak into other tests
+	ctx, ci := fs.AddConfig(context.TODO())
 	// Create a test certificate and write it to a temp file
 	ci.ClientCert = t.TempDir() + "client.cert"
 	ci.ClientKey = t.TempDir() + "client.key"
@@ -174,4 +201,60 @@ func TestCertificates(t *testing.T) {
 	// The new cert should be auto-loaded before we make this request
 	_, err = client.Get(ts.URL)
 	assert.NoError(t, err)
+}
+
+// TestRedirectStripsGlobalHeaders checks the headers set with --header
+// are sent to the requested host and any redirect on it but not to
+// another host the request is redirected to
+func TestRedirectStripsGlobalHeaders(t *testing.T) {
+	var got http.Header
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}))
+	defer target.Close()
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/same":
+			http.Redirect(w, r, ts.URL+"/moved", http.StatusFound)
+		case "/other":
+			http.Redirect(w, r, target.URL+"/moved", http.StatusFound)
+		case "/back":
+			// Chain via the other host and back again
+			http.Redirect(w, r, target.URL+"/bounce", http.StatusFound)
+		default:
+			got = r.Header.Clone()
+		}
+	}))
+	defer ts.Close()
+	// The other host bounces /bounce back to the original host
+	target.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bounce" {
+			http.Redirect(w, r, ts.URL+"/moved", http.StatusFound)
+			return
+		}
+		got = r.Header.Clone()
+	})
+
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.Headers = []*fs.HTTPOption{{Key: "X-Potato", Value: "sausage"}}
+	client := NewClient(ctx)
+
+	for _, test := range []struct {
+		path string
+		want string
+	}{
+		{"/direct", "sausage"},
+		{"/same", "sausage"},
+		{"/other", ""},
+		{"/back", ""},
+	} {
+		got = nil
+		resp, err := client.Get(ts.URL + test.path)
+		require.NoError(t, err, test.path)
+		require.NoError(t, resp.Body.Close())
+		require.NotNil(t, got, test.path)
+		assert.Equal(t, test.want, got.Get("X-Potato"), test.path)
+	}
 }

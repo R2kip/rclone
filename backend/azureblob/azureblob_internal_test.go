@@ -1,9 +1,12 @@
-//go:build !plan9 && !solaris && !js
+//go:build !plan9 && !js
 
 package azureblob
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -14,6 +17,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
@@ -48,6 +52,58 @@ func TestBlockIDCreator(t *testing.T) {
 	assert.ErrorContains(t, bic.checkID(chunkNumber, "AAAA"+got), "bad block ID length")
 	assert.ErrorContains(t, bic.checkID(chunkNumber+1, got), "expecting decoded")
 	assert.ErrorContains(t, bic2.checkID(chunkNumber, got), "random bytes")
+}
+
+func TestDecodeMetaDataFromDownloadResponse(t *testing.T) {
+	pInt64 := func(i int64) *int64 { return &i }
+	pString := func(s string) *string { return &s }
+	newTestObject := func() *Object {
+		return &Object{
+			fs:     &Fs{},
+			remote: "test.bin",
+			size:   -2, // sentinel to check it gets set
+		}
+	}
+
+	t.Run("WholeBlob", func(t *testing.T) {
+		o := newTestObject()
+		info := blob.DownloadStreamResponse{}
+		info.ContentLength = pInt64(12345)
+		require.NoError(t, o.decodeMetaDataFromDownloadResponse(&info))
+		assert.Equal(t, int64(12345), o.size)
+	})
+
+	t.Run("RangeRequest", func(t *testing.T) {
+		// On a ranged download Content-Length is the chunk length so the
+		// size must come from the total in Content-Range
+		o := newTestObject()
+		info := blob.DownloadStreamResponse{}
+		info.ContentLength = pInt64(67108864)
+		info.ContentRange = pString("bytes 67108864-134217727/169721004032")
+		require.NoError(t, o.decodeMetaDataFromDownloadResponse(&info))
+		assert.Equal(t, int64(169721004032), o.size)
+	})
+
+	t.Run("BadContentRange", func(t *testing.T) {
+		o := newTestObject()
+		info := blob.DownloadStreamResponse{}
+		info.ContentLength = pInt64(67108864)
+		info.ContentRange = pString("potato")
+		require.NoError(t, o.decodeMetaDataFromDownloadResponse(&info))
+		assert.Equal(t, int64(67108864), o.size)
+	})
+
+	t.Run("UnknownLength", func(t *testing.T) {
+		o := newTestObject()
+		info := blob.DownloadStreamResponse{}
+		require.NoError(t, o.decodeMetaDataFromDownloadResponse(&info))
+		assert.Equal(t, int64(-1), o.size)
+	})
+}
+
+func TestCopySASTimingConstants(t *testing.T) {
+	require.Greater(t, sasCopyStartSkew, time.Duration(0))
+	require.Greater(t, sasCopyValidity, sasCopyStartSkew)
 }
 
 func (f *Fs) testFeatures(t *testing.T) {
@@ -150,10 +206,66 @@ func (f *Fs) testWriteUncommittedBlocks(t *testing.T) {
 	require.NoError(t, dst.Remove(ctx))
 }
 
+func gz(t *testing.T, s string) string {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, err := zw.Write([]byte(s))
+	require.NoError(t, err)
+	err = zw.Close()
+	require.NoError(t, err)
+	return buf.String()
+}
+
+func md5sum(t *testing.T, s string) string {
+	hash := md5.Sum([]byte(s))
+	return fmt.Sprintf("%x", hash)
+}
+
+func (f *Fs) testGzipEncoding(t *testing.T) {
+	ctx := context.Background()
+	original := random.String(1000)
+	contents := gz(t, original)
+
+	item := fstest.NewItem("test-gzip", contents, fstest.Time("2001-05-06T04:05:06.499999999Z"))
+	metadata := fs.Metadata{
+		"content-encoding": "gzip",
+		"content-type":     "text/plain",
+	}
+	obj := fstests.PutTestContentsMetadata(ctx, t, f, &item, true, contents, true, "text/html", metadata)
+	defer func() {
+		assert.NoError(t, obj.Remove(ctx))
+	}()
+	o := obj.(*Object)
+
+	// Test that the gzipped file we uploaded can be
+	// downloaded with and without decompression
+	checkDownload := func(wantContents string, wantSize int64, wantHash string) {
+		gotContents := fstests.ReadObject(ctx, t, o, -1)
+		assert.Equal(t, wantContents, gotContents)
+		assert.Equal(t, wantSize, o.Size())
+		gotHash, err := o.Hash(ctx, hash.MD5)
+		require.NoError(t, err)
+		assert.Equal(t, wantHash, gotHash)
+	}
+
+	t.Run("NoDecompress", func(t *testing.T) {
+		checkDownload(contents, int64(len(contents)), md5sum(t, contents))
+	})
+	t.Run("Decompress", func(t *testing.T) {
+		f.opt.Decompress = true
+		defer func() {
+			f.opt.Decompress = false
+		}()
+		checkDownload(original, -1, "")
+	})
+}
+
 func (f *Fs) InternalTest(t *testing.T) {
 	t.Run("Features", f.testFeatures)
 	t.Run("WriteUncommittedBlocks", f.testWriteUncommittedBlocks)
 	t.Run("Metadata", f.testMetadataPaths)
+	t.Run("GzipEncoding", f.testGzipEncoding)
+	t.Run("ArrowList", f.testArrowList)
 }
 
 // helper to read blob properties for an object

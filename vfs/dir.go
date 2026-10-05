@@ -1,7 +1,6 @@
 package vfs
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,6 +24,7 @@ import (
 
 // Dir represents a directory entry
 type Dir struct {
+	aux                      // values attached by users of the VFS
 	vfs          *VFS        // read only
 	inode        uint64      // read only: inode number
 	f            fs.Fs       // read only
@@ -37,7 +37,6 @@ type Dir struct {
 	read    time.Time         // time directory entry last read
 	items   map[string]Node   // directory entries - can be empty but not nil
 	virtual map[string]vState // virtual directory entries - may be nil
-	sys     atomic.Value      // user defined info to be attached here
 
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
@@ -64,7 +63,7 @@ func newDir(vfs *VFS, f fs.Fs, parent *Dir, fsDir fs.Directory) *Dir {
 		parent:  parent,
 		entry:   fsDir,
 		path:    fsDir.Remote(),
-		modTime: fsDir.ModTime(context.TODO()),
+		modTime: fsDir.ModTime(vfs.ctx),
 		inode:   newInode(),
 		items:   make(map[string]Node),
 	}
@@ -180,16 +179,6 @@ func (d *Dir) Path() (name string) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.path
-}
-
-// Sys returns underlying data source (can be nil) - satisfies Node interface
-func (d *Dir) Sys() any {
-	return d.sys.Load()
-}
-
-// SetSys sets the underlying data source (can be nil) - satisfies Node interface
-func (d *Dir) SetSys(x any) {
-	d.sys.Store(x)
 }
 
 // Inode returns the inode number - satisfies Node interface
@@ -380,7 +369,7 @@ func (d *Dir) renameTree(dirPath string) {
 		delete(d.parent.items, name(d.path))
 		d.path = dirPath
 		d.parent.items[name(d.path)] = d
-		d.entry = fs.NewDirCopy(context.TODO(), d.entry).SetRemote(dirPath)
+		d.entry = fs.NewDirCopy(d.vfs.ctx, d.entry).SetRemote(dirPath)
 	}
 
 	// Do the same to any child directories and files
@@ -404,7 +393,7 @@ func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	d.ForgetAll()
 
 	d.modTimeMu.Lock()
-	d.modTime = fsDir.ModTime(context.TODO())
+	d.modTime = fsDir.ModTime(d.vfs.ctx)
 	d.modTimeMu.Unlock()
 	d.mu.Lock()
 	oldPath := d.path
@@ -539,7 +528,7 @@ func (d *Dir) _readDir() error {
 	} else {
 		return nil
 	}
-	entries, err := list.DirSorted(context.TODO(), d.f, false, d.path)
+	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
 	if err == fs.ErrorDirNotFound {
 		// We treat directory not found as empty because we
 		// create directories on the fly
@@ -548,7 +537,7 @@ func (d *Dir) _readDir() error {
 	}
 
 	if d.vfs.Opt.BlockNormDupes { // do this only if requested, as it will have a performance hit
-		ci := fs.GetConfig(context.TODO())
+		ci := fs.GetConfig(d.vfs.ctx)
 
 		// sort entries such that NFD comes before NFC of same name
 		sort.Slice(entries, func(i, j int) bool {
@@ -761,7 +750,7 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 			}
 			dir := node.(*Dir)
 			dir.mu.Lock()
-			dir.modTime = item.ModTime(context.TODO())
+			dir.modTime = item.ModTime(d.vfs.ctx)
 			dir.entry = item
 			if dirTree != nil {
 				err = dir._readDirFromDirTree(dirTree, when)
@@ -794,7 +783,7 @@ func (d *Dir) readDirTree() error {
 	d.mu.RUnlock()
 	when := time.Now()
 	fs.Debugf(path, "Reading directory tree")
-	dt, err := walk.NewDirTree(context.TODO(), f, path, false, -1)
+	dt, err := walk.NewDirTree(d.vfs.ctx, f, path, false, -1)
 	if err != nil {
 		return err
 	}
@@ -840,7 +829,7 @@ func (d *Dir) statMetadata(leaf, baseLeaf string) (metaNode Node, err error) {
 	entry := node.DirEntry()
 	var metadataDump []byte
 	if entry != nil {
-		metadata, err := fs.GetMetadata(context.TODO(), entry)
+		metadata, err := fs.GetMetadata(d.vfs.ctx, entry)
 		if err != nil {
 			metadataDump = jsonErrorf("failed to read metadata: %v", err)
 		} else if metadata == nil {
@@ -856,7 +845,7 @@ func (d *Dir) statMetadata(leaf, baseLeaf string) (metaNode Node, err error) {
 	}
 	// Make a memory based file with metadataDump in
 	remote := path.Join(d.path, leaf)
-	o := object.NewMemoryObject(remote, entry.ModTime(context.TODO()), metadataDump)
+	o := object.NewMemoryObject(remote, node.ModTime(), metadataDump)
 	f := newFile(d, d.path, o, leaf)
 	// Base the metadata inode number off the real file inode number
 	// to keep it constant
@@ -892,7 +881,7 @@ func (d *Dir) stat(leaf string) (Node, error) {
 		}
 	}
 
-	ci := fs.GetConfig(context.TODO())
+	ci := fs.GetConfig(d.vfs.ctx)
 	normUnicode := !ci.NoUnicodeNormalization
 	normCase := ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive
 	if !ok && (normUnicode || normCase) {
@@ -1085,7 +1074,7 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 		return nil, err
 	}
 	// fs.Debugf(path, "Dir.Mkdir")
-	err = d.f.Mkdir(context.TODO(), path)
+	err = d.f.Mkdir(d.vfs.ctx, path)
 	if err != nil {
 		fs.Errorf(d, "Dir.Mkdir failed to create directory: %v", err)
 		return nil, err
@@ -1117,7 +1106,7 @@ func (d *Dir) Remove() error {
 		return ENOTEMPTY
 	}
 	// remove directory
-	err = d.f.Rmdir(context.TODO(), d.path)
+	err = d.f.Rmdir(d.vfs.ctx, d.path)
 	if err != nil {
 		fs.Errorf(d, "Dir.Remove failed to remove directory: %v", err)
 		return err
@@ -1192,7 +1181,7 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	switch x := oldNode.DirEntry().(type) {
 	case nil:
 		if oldFile, ok := oldNode.(*File); ok {
-			if err = oldFile.rename(context.TODO(), destDir, newName); err != nil {
+			if err = oldFile.rename(d.vfs.ctx, destDir, newName); err != nil {
 				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 				return err
 			}
@@ -1202,7 +1191,7 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		}
 	case fs.Object:
 		if oldFile, ok := oldNode.(*File); ok {
-			if err = oldFile.rename(context.TODO(), destDir, newName); err != nil {
+			if err = oldFile.rename(d.vfs.ctx, destDir, newName); err != nil {
 				fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 				return err
 			}
@@ -1220,12 +1209,12 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		}
 		srcRemote := x.Remote()
 		dstRemote := newPath
-		err = operations.DirMove(context.TODO(), d.f, srcRemote, dstRemote)
+		err = operations.DirMove(d.vfs.ctx, d.f, srcRemote, dstRemote)
 		if err != nil {
 			fs.Errorf(oldPath, "Dir.Rename error: %v", err)
 			return err
 		}
-		newDir := fs.NewDirCopy(context.TODO(), x).SetRemote(newPath)
+		newDir := fs.NewDirCopy(d.vfs.ctx, x).SetRemote(newPath)
 		// Update the node with the new details
 		if oldNode != nil {
 			if oldDir, ok := oldNode.(*Dir); ok {

@@ -1,4 +1,4 @@
-//go:build !plan9 && !solaris && !js
+//go:build !plan9 && !js
 
 // Package azureblob provides an interface to the Microsoft Azure blob object storage system
 package azureblob
@@ -19,9 +19,9 @@ import (
 	"path"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -47,6 +47,8 @@ import (
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/pool"
+	"github.com/rclone/rclone/lib/readers"
+	"github.com/rclone/rclone/lib/rest"
 	"github.com/rclone/rclone/lib/transferaccounter"
 	"golang.org/x/sync/errgroup"
 )
@@ -65,7 +67,18 @@ const (
 	defaultChunkSize      = 4 * fs.Mebi
 	defaultAccessTier     = blob.AccessTier("") // FIXME AccessTierNone
 	sasCopyValidity       = time.Hour           // how long SAS should last when doing server side copy
+	sasCopyStartSkew      = 15 * time.Minute    // how far back SAS should start to allow for clock skew
 )
+
+// setAcceptEncodingGzip is a per-call policy that sets Accept-Encoding: gzip
+// on every request. This prevents the Go HTTP transport from automatically
+// decompressing gzip-encoded blobs on download.
+type setAcceptEncodingGzip struct{}
+
+func (p setAcceptEncodingGzip) Do(req *policy.Request) (*http.Response, error) {
+	req.Raw().Header.Set("Accept-Encoding", "gzip")
+	return req.Next()
+}
 
 var (
 	errCantUpdateArchiveTierBlobs = fserrors.NoRetryError(errors.New("can't update archive tier blob without --azureblob-archive-tier-delete"))
@@ -225,6 +238,40 @@ avoid the time out.`,
 			Default:  maxListChunkSize,
 			Advanced: true,
 		}, {
+			Name: "use_arrow_list",
+			Help: `Use the Apache Arrow listing format.
+
+If set, directory listings are fetched using the ListBlobs Apache
+Arrow response format instead of XML. Arrow responses are smaller and
+much cheaper to parse, making listings of large containers several
+times faster. Combine with "list_parallelism" for the biggest gains.
+
+"Blob Listing with Apache Arrow" is in public preview at Microsoft and
+is only supported on flat namespace accounts. On accounts with a
+hierarchical namespace (ADLS Gen2), or where the feature is otherwise
+unavailable, the server returns XML and the listing transparently
+falls back to the normal XML path (logged at debug level).`,
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "list_parallelism",
+			Help: `Number of parallel shards to list a directory with.
+
+If set greater than 1, the blob name keyspace of each directory is
+split into ranges which are listed concurrently using the Arrow
+startFrom/endBefore range parameters. This can dramatically speed up
+listing containers with millions of objects, for both recursive
+(ListR) and single directory listings. Speed keeps improving up to a
+parallelism of around 30.
+
+This has no effect unless "use_arrow_list" is also set, as Arrow is the
+only listing path that supports server-side name ranges. If the
+account does not support range listing (e.g. it has a hierarchical
+namespace) the listing falls back to sequential. The default of 0 (or
+1) lists sequentially.`,
+			Default:  0,
+			Advanced: true,
+		}, {
 			Name: "access_tier",
 			Help: `Access tier of blob: hot, cool, cold or archive.
 
@@ -350,6 +397,19 @@ rclone does if you know the container exists already.
 			Default:   "",
 			Exclusive: true,
 			Advanced:  true,
+		}, {
+			Name: "decompress",
+			Help: `If set this will decompress gzip encoded objects.
+
+It is possible to upload objects to Azure Blob Storage with "Content-Encoding: gzip"
+set. Normally rclone will download these files as compressed objects.
+
+If this flag is set then rclone will decompress these files with
+"Content-Encoding: gzip" as they are received. This means that rclone
+can't check the size and hash but the file contents will be decompressed.
+`,
+			Advanced: true,
+			Default:  false,
 		}}),
 	})
 }
@@ -364,6 +424,8 @@ type Options struct {
 	UseCopyBlob          bool                 `config:"use_copy_blob"`
 	UploadConcurrency    int                  `config:"upload_concurrency"`
 	ListChunkSize        uint                 `config:"list_chunk"`
+	UseArrowList         bool                 `config:"use_arrow_list"`
+	ListParallelism      int                  `config:"list_parallelism"`
 	AccessTier           string               `config:"access_tier"`
 	ArchiveTierDelete    bool                 `config:"archive_tier_delete"`
 	DisableCheckSum      bool                 `config:"disable_checksum"`
@@ -373,6 +435,7 @@ type Options struct {
 	NoCheckContainer     bool                 `config:"no_check_container"`
 	NoHeadObject         bool                 `config:"no_head_object"`
 	DeleteSnapshots      string               `config:"delete_snapshots"`
+	Decompress           bool                 `config:"decompress"`
 }
 
 // Fs represents a remote azure server
@@ -384,6 +447,7 @@ type Fs struct {
 	features           *fs.Features                 // optional features
 	cntSVCcacheMu      sync.Mutex                   // mutex to protect cntSVCcache
 	cntSVCcache        map[string]*container.Client // reference to containerClient per container
+	arrowXMLFallback   atomic.Bool                  // set once the server answers XML so parallel listing is not retried
 	svc                *service.Client              // client to access azblob
 	cred               azcore.TokenCredential       // how to generate tokens (may be nil)
 	usingSharedKeyCred bool                         // set if using shared key credentials
@@ -397,6 +461,8 @@ type Fs struct {
 	copyToken          *pacer.TokenDispenser        // global multipart copy concurrency limiter
 	publicAccess       container.PublicAccessType   // Container Public Access Level
 
+	warnCompressed sync.Once // warn once about compressed files
+
 	// user delegation cache
 	userDelegationMu     sync.Mutex
 	userDelegation       *service.UserDelegationCredential
@@ -405,15 +471,16 @@ type Fs struct {
 
 // Object describes an azure object
 type Object struct {
-	fs         *Fs               // what this object is part of
-	remote     string            // The remote path
-	modTime    time.Time         // The modified time of the object if known
-	md5        string            // MD5 hash if known
-	size       int64             // Size of the object
-	mimeType   string            // Content-Type of the object
-	accessTier blob.AccessTier   // Blob Access Tier
-	meta       map[string]string // blob metadata - take metadataMu when accessing
-	tags       map[string]string // blob tags
+	fs              *Fs               // what this object is part of
+	remote          string            // The remote path
+	modTime         time.Time         // The modified time of the object if known
+	md5             string            // MD5 hash if known
+	size            int64             // Size of the object
+	mimeType        string            // Content-Type of the object
+	accessTier      blob.AccessTier   // Blob Access Tier
+	meta            map[string]string // blob metadata - take metadataMu when accessing
+	tags            map[string]string // blob tags
+	contentEncoding *string           // Content-Encoding of the object
 }
 
 // ------------------------------------------------------------
@@ -502,8 +569,7 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
-	var storageErr *azcore.ResponseError
-	if errors.As(err, &storageErr) {
+	if storageErr, ok := errors.AsType[*azcore.ResponseError](err); ok {
 		// General errors from:
 		// https://learn.microsoft.com/en-us/rest/api/storageservices/common-rest-api-error-codes
 		// Blob specific errors from:
@@ -580,6 +646,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.ListChunkSize > maxListChunkSize {
 		return nil, fmt.Errorf("blob list size can't be greater than %v - was %v", maxListChunkSize, opt.ListChunkSize)
 	}
+	if opt.ListParallelism > 1 && !opt.UseArrowList {
+		fs.Logf(nil, "azureblob: list_parallelism has no effect without use_arrow_list - listing sequentially")
+	}
 
 	if opt.AccessTier == "" {
 		opt.AccessTier = string(defaultAccessTier)
@@ -634,6 +703,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		NewClientWithSharedKeyCredential: service.NewClientWithSharedKeyCredential,
 		NewSharedKeyCredential:           service.NewSharedKeyCredential,
 		SetClientOptions: func(options *service.ClientOptions, policyClientOptions policy.ClientOptions) {
+			// Override the automatic decompression in the transport
+			// to download compressed files as-is
+			policyClientOptions.PerCallPolicies = append(policyClientOptions.PerCallPolicies, setAcceptEncodingGzip{})
 			options.ClientOptions = policyClientOptions
 		},
 	}
@@ -778,15 +850,15 @@ func mapMetadataToAzure(meta map[string]string, logf func(string, ...any)) (head
 		lowerKey := strings.ToLower(k)
 		switch lowerKey {
 		case "cache-control":
-			headers.BlobCacheControl = pString(v)
+			headers.BlobCacheControl = new(v)
 		case "content-disposition":
-			headers.BlobContentDisposition = pString(v)
+			headers.BlobContentDisposition = new(v)
 		case "content-encoding":
-			headers.BlobContentEncoding = pString(v)
+			headers.BlobContentEncoding = new(v)
 		case "content-language":
-			headers.BlobContentLanguage = pString(v)
+			headers.BlobContentLanguage = new(v)
 		case "content-type":
-			headers.BlobContentType = pString(v)
+			headers.BlobContentType = new(v)
 		case "x-ms-tags":
 			parsed, perr := parseXMsTags(v)
 			if perr != nil {
@@ -1060,7 +1132,7 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 		delimiter = "/"
 	}
 
-	pager := f.cntSVC(containerName).NewListBlobsHierarchyPager(delimiter, &container.ListBlobsHierarchyOptions{
+	opts := &container.ListBlobsHierarchyOptions{
 		// Copy, Metadata, Snapshots, UncommittedBlobs, Deleted, Tags, Versions, LegalHold, ImmutabilityPolicy, DeletedWithVersions bool
 		Include: container.ListBlobsInclude{
 			Copy:             false,
@@ -1071,8 +1143,50 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 		},
 		Prefix:     &directory,
 		MaxResults: &maxResults,
-	})
-	foundItems := 0
+	}
+	// Request the Apache Arrow listing format. The SDK pager requests an
+	// Arrow IPC stream and decodes it, falling back to XML if the account
+	// doesn't have Arrow listing enabled. Skip the maxResults==1 probe
+	// (isEmpty) which doesn't benefit.
+	useArrow := f.opt.UseArrowList && maxResults != 1
+	if useArrow {
+		opts.ResponseFormat = container.StorageResponseFormatArrow
+	}
+
+	var foundItems int
+	var err error
+	if useArrow && f.opt.ListParallelism > 1 && !f.arrowXMLFallback.Load() {
+		// Arrow exposes server-side startFrom/endBefore name ranges, so the
+		// keyspace can be sharded and listed concurrently.
+		foundItems, err = f.listArrowParallel(ctx, containerName, directory, prefix, addContainer, opts, delimiter, fn)
+	} else {
+		foundItems, err = f.listBlobsPager(ctx, containerName, directory, prefix, addContainer, opts, delimiter, fn)
+	}
+	if err != nil {
+		return err
+	}
+	if f.opt.DirectoryMarkers && foundItems == 0 && directory != "" {
+		// Determine whether the directory exists or not by whether it has a marker
+		_, err := f.readMetaData(ctx, containerName, directory)
+		if err != nil {
+			if err == fs.ErrorObjectNotFound {
+				return fs.ErrorDirNotFound
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// listBlobsPager runs the hierarchy listing described by opts, calling fn for
+// each blob and subdirectory, and returns the number of raw items seen.
+// delimiter selects flat (recurse) vs hierarchical listing. If opts requests
+// the Apache Arrow format and the service answers with XML (Arrow listing
+// not enabled) a debug message is logged.
+func (f *Fs) listBlobsPager(ctx context.Context, containerName, directory, prefix string, addContainer bool, opts *container.ListBlobsHierarchyOptions, delimiter string, fn listFn) (foundItems int, err error) {
+	useArrow := opts.ResponseFormat == container.StorageResponseFormatArrow
+	pager := f.cntSVC(containerName).NewListBlobsHierarchyPager(delimiter, opts)
+	checkedArrow := false
 	for pager.More() {
 		var response container.ListBlobsHierarchyResponse
 		err := f.pacer.Call(func() (bool, error) {
@@ -1082,12 +1196,22 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 			return f.shouldRetry(ctx, err)
 		})
 
+		// If Arrow was requested but the service answered with XML, Arrow
+		// listing is not enabled on this account; the listing is still correct
+		// but not accelerated.
+		if useArrow && !checkedArrow && err == nil {
+			checkedArrow = true
+			if response.ContentType == nil || !strings.HasPrefix(*response.ContentType, arrowContentType) {
+				fs.Debugf(f, "Apache Arrow listing requested but server returned XML - Blob Listing with Apache Arrow may not be enabled on this account")
+			}
+		}
+
 		if err != nil {
 			// Check http error code along with service code, current SDK doesn't populate service code correctly sometimes
 			if storageErr, ok := err.(*azcore.ResponseError); ok && (storageErr.ErrorCode == string(bloberror.ContainerNotFound) || storageErr.StatusCode == http.StatusNotFound) {
-				return fs.ErrorDirNotFound
+				return foundItems, fs.ErrorDirNotFound
 			}
-			return err
+			return foundItems, err
 		}
 		// Advance marker to next
 		// marker = response.NextMarker
@@ -1107,7 +1231,12 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 				fs.Debugf(f, "Odd name received %q", remote)
 				continue
 			}
-			isDirectory := isDirectoryMarker(*file.Properties.ContentLength, file.Metadata, remote)
+			// ContentLength is documented as nullable in the Arrow listing schema
+			size := int64(-1)
+			if file.Properties.ContentLength != nil {
+				size = *file.Properties.ContentLength
+			}
+			isDirectory := isDirectoryMarker(size, file.Metadata, remote)
 			if isDirectory {
 				// Don't insert the root directory
 				if remote == f.opt.Enc.ToStandardPath(directory) {
@@ -1123,7 +1252,7 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 			// Send object
 			err = fn(remote, file, isDirectory)
 			if err != nil {
-				return err
+				return foundItems, err
 			}
 		}
 		// Send the subdirectories
@@ -1138,6 +1267,13 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 				fs.Debugf(f, "Odd directory name received %q", remote)
 				continue
 			}
+			// Don't insert the root directory. The Arrow listing returns a
+			// directory marker blob with the same name as the listed directory
+			// as a BlobPrefix, whereas XML returns it as a blob (handled
+			// above).
+			if remote == f.opt.Enc.ToStandardPath(directory) {
+				continue
+			}
 			remote = remote[len(prefix):]
 			// Trim one slash off the remote name
 			remote, _ = strings.CutSuffix(remote, "/")
@@ -1150,21 +1286,11 @@ func (f *Fs) list(ctx context.Context, containerName, directory, prefix string, 
 			// Send object
 			err = fn(remote, nil, true)
 			if err != nil {
-				return err
+				return foundItems, err
 			}
 		}
 	}
-	if f.opt.DirectoryMarkers && foundItems == 0 && directory != "" {
-		// Determine whether the directory exists or not by whether it has a marker
-		_, err := f.readMetaData(ctx, containerName, directory)
-		if err != nil {
-			if err == fs.ErrorObjectNotFound {
-				return fs.ErrorDirNotFound
-			}
-			return err
-		}
-	}
-	return nil
+	return foundItems, nil
 }
 
 // Convert a list item into a DirEntry
@@ -1630,7 +1756,7 @@ func (f *Fs) getUserDelegation(ctx context.Context) (*service.UserDelegationCred
 	}
 
 	// Validity window
-	start := time.Now().UTC()
+	start := time.Now().UTC().Add(-sasCopyStartSkew)
 	expiry := start.Add(2 * sasCopyValidity)
 	startStr := start.Format(time.RFC3339)
 	expiryStr := expiry.Format(time.RFC3339)
@@ -1679,7 +1805,7 @@ func (o *Object) getAuth(ctx context.Context, noAuth bool) (srcURL string, err e
 		// Build the SAS values
 		perms := sas.BlobPermissions{Read: true}
 		container, containerPath := o.split()
-		start := time.Now().UTC()
+		start := time.Now().UTC().Add(-sasCopyStartSkew)
 		expiry := start.Add(sasCopyValidity)
 		vals := sas.BlobSignatureValues{
 			StartTime:     start,
@@ -2001,6 +2127,10 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if t != hash.MD5 {
 		return "", hash.ErrUnsupported
 	}
+	// If decompressing, erase the hash
+	if o.size < 0 {
+		return "", nil
+	}
 	// Convert base64 encoded md5 into lower case hex
 	if o.md5 == "" {
 		return "", nil
@@ -2126,6 +2256,13 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesRe
 		o.accessTier = blob.AccessTier(*info.AccessTier)
 	}
 	o.setMetadata(metadata)
+	o.contentEncoding = info.ContentEncoding
+
+	// If decompressing then size and md5sum are unknown
+	if o.fs.opt.Decompress && o.contentEncoding != nil && *o.contentEncoding == "gzip" {
+		o.size = -1
+		o.md5 = ""
+	}
 
 	return nil
 }
@@ -2138,12 +2275,31 @@ func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamRes
 	} else {
 		size = *info.ContentLength
 	}
+	// On a range request Content-Length is the length of the range, not the object, so take the
+	// object's size from the total in Content-Range instead.
+	if info.ContentRange != nil {
+		contentRange, err := rest.ParseContentRange(*info.ContentRange)
+		if err != nil {
+			fs.Debugf(o, "Failed to parse Content-Range %q: %v", *info.ContentRange, err)
+		} else if contentRange.Size >= 0 {
+			size = contentRange.Size
+		}
+	}
 	if isDirectoryMarker(size, metadata, o.remote) {
 		return fs.ErrorNotAFile
 	}
 	// NOTE - Client library always returns MD5 as base64 decoded string, Object needs to maintain
 	// this as base64 encoded string.
-	o.md5 = base64.StdEncoding.EncodeToString(info.ContentMD5)
+	//
+	// On a range request the service returns the whole-blob MD5 in the
+	// x-ms-blob-content-md5 header (BlobContentMD5) and leaves Content-MD5
+	// (ContentMD5) empty, so prefer BlobContentMD5. Never overwrite a known
+	// hash with an empty one, or a ranged read would drop the object's MD5.
+	if md5 := info.BlobContentMD5; len(md5) > 0 {
+		o.md5 = base64.StdEncoding.EncodeToString(md5)
+	} else if len(info.ContentMD5) > 0 {
+		o.md5 = base64.StdEncoding.EncodeToString(info.ContentMD5)
+	}
 	if info.ContentType == nil {
 		o.mimeType = ""
 	} else {
@@ -2162,21 +2318,12 @@ func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamRes
 	// 	o.accessTier = blob.AccessTier(*info.AccessTier)
 	// }
 	o.setMetadata(metadata)
+	o.contentEncoding = info.ContentEncoding
 
-	// If it was a Range request, the size is wrong, so correct it
-	if info.ContentRange != nil {
-		contentRange := *info.ContentRange
-		slash := strings.IndexRune(contentRange, '/')
-		if slash >= 0 {
-			i, err := strconv.ParseInt(contentRange[slash+1:], 10, 64)
-			if err == nil {
-				o.size = i
-			} else {
-				fs.Debugf(o, "Failed to find parse integer from in %q: %v", contentRange, err)
-			}
-		} else {
-			fs.Debugf(o, "Failed to find length in %q", contentRange)
-		}
+	// If decompressing then size and md5sum are unknown
+	if o.fs.opt.Decompress && o.contentEncoding != nil && *o.contentEncoding == "gzip" {
+		o.size = -1
+		o.md5 = ""
 	}
 
 	return nil
@@ -2216,6 +2363,13 @@ func (o *Object) decodeMetaDataFromBlob(info *container.BlobItem) (err error) {
 		o.accessTier = *info.Properties.AccessTier
 	}
 	o.setMetadata(metadata)
+	o.contentEncoding = info.Properties.ContentEncoding
+
+	// If decompressing then size and md5sum are unknown
+	if o.fs.opt.Decompress && o.contentEncoding != nil && *o.contentEncoding == "gzip" {
+		o.size = -1
+		o.md5 = ""
+	}
 
 	return nil
 }
@@ -2391,12 +2545,18 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode metadata for download: %w", err)
 	}
-	return downloadResponse.Body, nil
-}
 
-// Converts a string into a pointer to a string
-func pString(s string) *string {
-	return &s
+	// Decompress body if necessary
+	if downloadResponse.ContentEncoding != nil && *downloadResponse.ContentEncoding == "gzip" {
+		if o.fs.opt.Decompress {
+			return readers.NewGzipReader(downloadResponse.Body)
+		}
+		o.fs.warnCompressed.Do(func() {
+			fs.Logf(o, "Not decompressing 'Content-Encoding: gzip' compressed file. Use --azureblob-decompress to override")
+		})
+	}
+
+	return downloadResponse.Body, nil
 }
 
 // readSeekCloser joins an io.Reader and an io.Seeker and provides a no-op io.Closer
@@ -2553,8 +2713,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 // isInvalidBlockOrBlob looks for the InvalidBlockOrBlob error in err
 // returning true if it is found
 func isInvalidBlockOrBlob(err error) bool {
-	var storageErr *azcore.ResponseError
-	if errors.As(err, &storageErr) {
+	if storageErr, ok := errors.AsType[*azcore.ResponseError](err); ok {
 		return storageErr.ErrorCode == string(bloberror.InvalidBlobOrBlock)
 	}
 	return false
@@ -2926,7 +3085,7 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 
 	// Start with default content-type based on source
 	ui.httpHeaders = blob.HTTPHeaders{
-		BlobContentType: pString(fs.MimeType(ctx, src)),
+		BlobContentType: new(fs.MimeType(ctx, src)),
 	}
 
 	// Apply mapped metadata/headers/tags if requested
@@ -2972,15 +3131,15 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 				o.tags[parts[0]] = parts[1]
 			}
 		case "cache-control":
-			ui.httpHeaders.BlobCacheControl = pString(value)
+			ui.httpHeaders.BlobCacheControl = new(value)
 		case "content-disposition":
-			ui.httpHeaders.BlobContentDisposition = pString(value)
+			ui.httpHeaders.BlobContentDisposition = new(value)
 		case "content-encoding":
-			ui.httpHeaders.BlobContentEncoding = pString(value)
+			ui.httpHeaders.BlobContentEncoding = new(value)
 		case "content-language":
-			ui.httpHeaders.BlobContentLanguage = pString(value)
+			ui.httpHeaders.BlobContentLanguage = new(value)
 		case "content-type":
-			ui.httpHeaders.BlobContentType = pString(value)
+			ui.httpHeaders.BlobContentType = new(value)
 		}
 	}
 
